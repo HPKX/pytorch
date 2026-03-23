@@ -1,0 +1,17 @@
+# torch API 161-165 ATen Dispatch 分析
+
+| 接口 | 场景 | ATen Dispatch 调用链 | 正向 Dispatch 依赖的 ATen 接口 |
+| --- | --- | --- | --- |
+| `torch.nn.functional.softsign` | 普通稠密 Tensor | `F.softsign -> aten::abs -> aten::add.Scalar -> aten::div.Tensor -> 后端逐元素 kernel` | `aten::abs`, `aten::add.Scalar`, `aten::div.Tensor` |
+| `torch.nn.functional.triplet_margin_loss` | `swap=False, reduction='mean'` | `F.triplet_margin_loss -> aten::triplet_margin_loss -> CompositeImplicitAutograd(native::triplet_margin_loss) -> 2x aten::pairwise_distance -> CompositeImplicitAutograd(native::pairwise_distance) -> aten::sub.Tensor -> aten::add.Scalar -> aten::norm.ScalarOpt_dim -> aten::add.Scalar -> aten::sub.Tensor -> aten::clamp_min -> aten::mean` | `aten::triplet_margin_loss`, `aten::pairwise_distance`, `aten::sub.Tensor`, `aten::add.Scalar`, `aten::norm.ScalarOpt_dim`, `aten::clamp_min`, `aten::mean` |
+| `torch.nn.functional.triplet_margin_loss` | `swap=True, reduction='mean'` | `F.triplet_margin_loss -> aten::triplet_margin_loss -> CompositeImplicitAutograd(native::triplet_margin_loss) -> 3x aten::pairwise_distance -> aten::min.other -> aten::add.Scalar -> aten::sub.Tensor -> aten::clamp_min -> aten::mean` | `aten::triplet_margin_loss`, `aten::pairwise_distance`, `aten::min.other`, `aten::add.Scalar`, `aten::sub.Tensor`, `aten::clamp_min`, `aten::mean` |
+| `torch.nn.functional.upsample` | 4D 输入，`mode='nearest'` | `F.upsample -> F.interpolate -> aten::upsample_nearest2d.vec -> CompositeImplicitAutograd(native::upsample_nearest2d helper) -> aten::upsample_nearest2d -> [AutogradCPU/CUDA] -> CPU/CUDA structured meta+impl -> upsample_nearest2d_kernel stub -> kernel` | `aten::upsample_nearest2d.vec`, `aten::upsample_nearest2d` |
+| `torch.nn.functional.upsample` | 4D 输入，`mode='bilinear'` | `F.upsample -> F.interpolate -> aten::upsample_bilinear2d.vec -> CompositeImplicitAutograd(native::upsample_bilinear2d helper) -> aten::upsample_bilinear2d -> [AutogradCPU/CUDA] -> CPU/CUDA structured meta+impl -> upsample_bilinear2d_kernel stub -> kernel` | `aten::upsample_bilinear2d.vec`, `aten::upsample_bilinear2d` |
+| `torch.nn.modules.ChannelShuffle` | CPU 稠密 Tensor，常见非 XNNPACK 路径 | `ChannelShuffle.forward -> F.channel_shuffle -> aten::channel_shuffle -> [AutogradCPU] -> CPU wrapper(native::channel_shuffle) -> aten::native_channel_shuffle -> CPU wrapper(channel_shuffle_cpu) -> channel_shuffle_kernel(kCPU)` | `aten::channel_shuffle`, `aten::native_channel_shuffle` |
+| `torch.nn.modules.ChannelShuffle` | CUDA Tensor | `ChannelShuffle.forward -> F.channel_shuffle -> aten::channel_shuffle -> [AutogradCUDA] -> CUDA wrapper(native::channel_shuffle) -> aten::native_channel_shuffle -> CompositeImplicitAutograd(math_channel_shuffle) -> aten::view -> aten::permute -> aten::contiguous -> aten::reshape` | `aten::channel_shuffle`, `aten::native_channel_shuffle`, `aten::view`, `aten::permute`, `aten::contiguous`, `aten::reshape` |
+| `torch.nn.modules.flatten.Flatten` | 连续内存输入，默认 `start_dim=1,end_dim=-1` | `Flatten.forward -> Tensor.flatten -> aten::flatten.using_ints -> CompositeImplicitAutograd(native::flatten) -> aten::view` | `aten::flatten.using_ints`, `aten::view` |
+
+## 备注
+- `softsign` 是纯 Python 组合表达式，没有单独的 `aten::softsign` 首跳。
+- `upsample` 只是到 `interpolate` 的弃用别名；这里列的是最常见的 4D `nearest` / `bilinear` 分支。
+- `Flatten` 的常见连续内存路径会落到 `aten::view`；非连续但可重解释形状时通常走 `aten::_reshape_alias`，再差则退化为拷贝后 `_unsafe_view`。

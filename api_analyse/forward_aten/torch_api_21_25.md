@@ -1,0 +1,18 @@
+# torch API 21-25 ATen Dispatch 分析
+| 接口 | 场景 | ATen Dispatch 调用链 | 正向 Dispatch 依赖的 ATen 接口 |
+| --- | --- | --- | --- |
+| `torch.column_stack` | 将多个张量按列拼接（1D 自动 reshape 为列向量） | `torch.column_stack(tensors)` → `aten::column_stack` (CompositeImplicitAutograd，YAML 无 dispatch key) → `native::column_stack` (`TensorShape.cpp:3627`)：对每个 `dim <= 1` 输入调用 `aten::reshape` 变为 `(numel, 1)` → `aten::hstack(reshaped_tensors)` → `native::hstack`：`aten::atleast_1d.Sequence` → `aten::cat` | `aten::column_stack`, `aten::reshape`, `aten::hstack`, `aten::atleast_1d.Sequence`, `aten::cat` |
+| `torch.combinations` | 生成输入 1D 张量的 r-组合 | `torch.combinations(self, r, with_replacement)` → `aten::combinations` (CompositeImplicitAutograd，YAML 无 dispatch key) → `native::combinations` (`Itertools.cpp:60`)：`r == 0` 时直接返回 `aten::empty`；否则先 `aten::meshgrid`，`_triu_mask` 内部再调用 `aten::arange` + `aten::meshgrid` + `aten::full` 构造上三角掩码 → 对每个 grid 调用 `aten::masked_select` → `aten::stack` | `aten::combinations`, `aten::empty`, `aten::meshgrid`, `aten::arange`, `aten::full`, `aten::masked_select`, `aten::stack` |
+| `torch.cond` | 条件控制流（根据 pred 选择执行 true_fn 或 false_fn） | `torch.cond(pred, true_fn, false_fn, operands)` → Python 层 `cond()` (`torch/_higher_order_ops/cond.py:96`)：**非 ATen 算子，是 HigherOrderOperator**。Eager 模式下：若 pred 为 Python 常量直接选分支执行；若 pred 为 Tensor，通过 `torch.compile` 包装 `cond_op` 执行。`cond_op` 注册了多个 dispatch：CompositeExplicitAutograd (`cond_op_dense`)：直接 `if pred: true_fn(*operands) else: false_fn(*operands)`；Autograd (`cond_autograd`)：通过 `CondAutogradOp.apply` 实现前向/反向；FakeTensorMode、ProxyTorchDispatchMode、Functionalize、Vmap 均有 Python 层 impl | `torch._higher_order_ops.cond.cond_op` (HigherOrderOperator)，不涉及传统 ATen native 算子 |
+| `torch.conj` | 返回共轭视图（complex tensor 为惰性共轭，real tensor 原样返回） | `torch.conj(self)` → `aten::conj` (manual_cpp_binding) → `native::conj` (`UnaryOps.cpp:660`) → `self.conj()`：若非 complex 直接返回 self；若为 sparse 布局调用 `aten::conj_physical`；否则调用 `aten::_conj` → `native::_conj` (`UnaryOps.cpp:653`)：创建 alias 并翻转 conj bit。`aten::conj_physical` 对 complex 输入继续进入 `aten::_conj_physical` | `aten::conj`, `aten::conj_physical`, `aten::_conj`, `aten::_conj_physical` |
+| `torch.copysign` | 按元素组合 self 的绝对值和 other 的符号 | **Tensor 重载**：`torch.copysign(self, other: Tensor)` → `aten::copysign.Tensor` → 若需要梯度先过 `AutogradCPU/CUDA/MPS`，随后进入 CPU/CUDA/MPS structured wrapper（`meta + impl`）→ `copysign_stub` → backend kernel。**Scalar 重载**：`torch.copysign(self, other: Scalar)` → `aten::copysign.Scalar` → `CompositeExplicitAutograd native::copysign` → 将 `other` 包成 wrapped scalar tensor 后重入 `aten::copysign.Tensor` | `aten::copysign.Tensor`, `aten::copysign.Scalar` |
+
+## 备注
+
+1. **torch.column_stack** 和 **torch.combinations** 在 YAML 中均无 dispatch key，属于 CompositeImplicitAutograd；autograd 由内部调用的 `aten::reshape`、`aten::cat`、`aten::masked_select`、`aten::stack` 等算子自动提供，因此 `derivatives.yaml` 中没有它们的条目。
+
+2. **torch.cond** 不是传统 ATen 算子，而是 Python 层的 `HigherOrderOperator`，在 `native_functions.yaml` 中无定义。它的 dispatch 完全在 Python 端通过 `py_impl` 注册到不同 DispatchKey（CompositeExplicitAutograd、Autograd、FakeTensorMode、ProxyTorchDispatchMode、Functionalize、Vmap）。Eager 模式下对 Tensor pred 会通过 `torch.compile` 包装执行。
+
+3. **torch.conj** 使用 `manual_cpp_binding: True`，native 实现最终转发到 `Tensor::conj()`。对于稠密 complex tensor 走 `aten::_conj` 路径，仅设置 conj bit 而不做数据复制（惰性共轭视图）；稀疏 complex tensor 则走 `aten::conj_physical` / `aten::_conj_physical`。`derivatives.yaml` 中无 `conj` 条目，autograd 注册在 `_conj` 上。
+
+4. **torch.copysign** 的 Tensor 重载是 structured op，通过 `structured_delegate: copysign.out` 由 codegen 生成 `.Tensor` 和 `_.Tensor` 的分发代码（非运行时跳转）。Scalar 重载则通过 CompositeExplicitAutograd 包装为 Tensor 后重新 dispatch。

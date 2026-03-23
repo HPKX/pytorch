@@ -1,0 +1,1 @@
+/Users/hz/Desktop/Code/mindspore/api_refactor/api_list/ops_only_with_torch_target.md
